@@ -1196,11 +1196,11 @@ class TestIsRateLimitError:
 class TestGetProviderChain:
     """_get_provider_chain() resolves functions at call time (testable)."""
 
-    def test_returns_four_entries(self):
+    def test_returns_five_entries_with_guard(self):
         chain = _get_provider_chain()
-        assert len(chain) == 4
+        assert len(chain) == 5
         labels = [label for label, _ in chain]
-        assert labels == ["openrouter", "nous", "local/custom", "api-key"]
+        assert labels == ["guard", "openrouter", "nous", "local/custom", "api-key"]
         # Codex is deliberately NOT in this chain — see _get_provider_chain
         # docstring. ChatGPT-account Codex has a shifting model allow-list;
         # guessing a model to fall back on breaks more often than it helps.
@@ -1211,7 +1211,7 @@ class TestGetProviderChain:
         sentinel = lambda: ("patched", "model")
         with patch("agent.auxiliary_client._try_openrouter", sentinel):
             chain = _get_provider_chain()
-        assert chain[0] == ("openrouter", sentinel)
+        assert chain[1] == ("openrouter", sentinel)  # guard now at [0]
 
 
 class TestTryPaymentFallback:
@@ -1362,6 +1362,8 @@ class TestAuxiliaryFallbackLayering:
                    return_value=(primary_client, "glm-4v-flash")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("glm", "glm-4v-flash", None, None, None)), \
+             patch("agent.auxiliary_client._iter_configured_fallback_clients",
+                   return_value=iter([])), \
              patch("agent.auxiliary_client._try_configured_fallback_chain",
                    return_value=(chain_client, "gpt-4o-mini", "fallback_chain[0](openai)")), \
              patch("agent.auxiliary_client._try_main_agent_model_fallback",
@@ -1391,6 +1393,8 @@ class TestAuxiliaryFallbackLayering:
                    return_value=(primary_client, "glm-4v-flash")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("glm", "glm-4v-flash", None, None, None)), \
+             patch("agent.auxiliary_client._iter_configured_fallback_clients",
+                   return_value=iter([])), \
              patch("agent.auxiliary_client._try_configured_fallback_chain",
                    return_value=(None, None, "")), \
              patch("agent.auxiliary_client._try_main_agent_model_fallback",
@@ -1413,10 +1417,14 @@ class TestAuxiliaryFallbackLayering:
                    return_value=(primary_client, "glm-4v-flash")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("glm", "glm-4v-flash", None, None, None)), \
+             patch("agent.auxiliary_client._iter_configured_fallback_clients",
+                   return_value=iter([])), \
              patch("agent.auxiliary_client._try_configured_fallback_chain",
                    return_value=(None, None, "")), \
              patch("agent.auxiliary_client._try_main_agent_model_fallback",
                    return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   return_value=None), \
              caplog.at_level("WARNING", logger="agent.auxiliary_client"):
             with pytest.raises(Exception, match="Payment Required"):
                 call_llm(
@@ -1467,6 +1475,322 @@ class TestTryMainAgentModelFallback:
              patch("agent.auxiliary_client._is_provider_unhealthy", return_value=True):
             client, model, label = _try_main_agent_model_fallback("glm", task="vision")
         assert client is None
+
+
+class TestConfiguredFallbackProvidersChain:
+    """Auto auxiliary calls should walk configured main fallback_providers."""
+
+    def _make_429_rate_limit_error(self, msg="Rate limit exceeded, try again in 60 seconds"):
+        exc = Exception(msg)
+        exc.status_code = 429
+        return exc
+
+    def test_auto_uses_configured_fallback_providers_before_legacy_chain(self):
+        """Auto auxiliary calls should walk configured main fallback_providers first."""
+        primary_client = MagicMock()
+        primary_client.base_url = "https://chatgpt.com/backend-api/codex"
+        primary_client.chat.completions.create.side_effect = self._make_429_rate_limit_error()
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.z.ai/api/coding/paas/v4"
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="configured fallback response"))
+        ])
+
+        cfg = {
+            "fallback_providers": [
+                {
+                    "provider": "zai",
+                    "model": "glm-5.1",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                    "api_mode": "chat_completions",
+                },
+                {"provider": "deepseek", "model": "deepseek-v4-pro"},
+            ]
+        }
+
+        resolve_calls = []
+
+        def fake_resolve(provider, **kwargs):
+            resolve_calls.append((provider, kwargs))
+            assert provider == "zai"
+            assert kwargs["model"] == "glm-5.1"
+            assert kwargs["explicit_base_url"] == "https://api.z.ai/api/coding/paas/v4"
+            assert kwargs["api_mode"] == "chat_completions"
+            assert kwargs.get("async_mode") in {False, None}
+            return fallback_client, "glm-5.1"
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._configured_fallback_entries",
+                   return_value=cfg["fallback_providers"]), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._rate_limit_guard_skips", return_value=False), \
+             patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+             patch("agent.auxiliary_client._try_payment_fallback", return_value=None) as legacy:
+            result = call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "configured fallback response"
+        assert [provider for provider, _ in resolve_calls] == ["zai"]
+        assert not legacy.called
+
+    def test_configured_fallback_chain_continues_after_first_fallback_rate_limit(self):
+        """If one configured fallback 429s, auxiliary should try the next configured fallback."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_429_rate_limit_error("primary 429")
+
+        zai_client = MagicMock()
+        zai_client.base_url = "https://api.z.ai/api/coding/paas/v4"
+        zai_client.chat.completions.create.side_effect = self._make_429_rate_limit_error("zai 429")
+
+        go_client = MagicMock()
+        go_client.base_url = "https://opencode.ai/zen/go/v1"
+        go_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="go response"))
+        ])
+
+        cfg = {
+            "fallback_providers": [
+                {"provider": "zai", "model": "glm-5.1"},
+                {"provider": "opencode-go", "model": "deepseek-v4-pro"},
+            ]
+        }
+
+        clients = {
+            "zai": (zai_client, "glm-5.1"),
+            "opencode-go": (go_client, "deepseek-v4-pro"),
+        }
+        resolve_calls = []
+
+        def fake_resolve(provider, **kwargs):
+            resolve_calls.append(provider)
+            return clients[provider]
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._configured_fallback_entries",
+                   return_value=cfg["fallback_providers"]), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._rate_limit_guard_skips", return_value=False), \
+             patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+             patch("agent.auxiliary_client._try_payment_fallback", return_value=None) as legacy:
+            result = call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "go response"
+        assert resolve_calls == ["zai", "opencode-go"]
+        assert not legacy.called
+
+    def test_primary_connection_error_still_evicts_after_configured_fallback_rate_limit(self):
+        """Fallback errors must not mask primary connection-error cache eviction."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = Exception("connection refused: timeout")
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.side_effect = self._make_429_rate_limit_error("fallback 429")
+        cfg = {"fallback_providers": [{"provider": "zai", "model": "glm-5.1"}]}
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._configured_fallback_entries", return_value=cfg["fallback_providers"]), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._rate_limit_guard_skips", return_value=False), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fallback_client, "glm-5.1")), \
+             patch("agent.auxiliary_client._try_payment_fallback", return_value=None), \
+             patch("agent.auxiliary_client._evict_cached_client_instance") as evict:
+            with pytest.raises(Exception, match="connection refused"):
+                call_llm(
+                    task="session_search",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        evict.assert_called_once_with(primary_client)
+
+    def test_primary_rate_limit_not_evicted_when_configured_fallback_connection_fails(self):
+        """A fallback connection error must not make us evict the primary rate-limited client."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_429_rate_limit_error("primary 429")
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.side_effect = Exception("connection refused: fallback timeout")
+        cfg = {"fallback_providers": [{"provider": "zai", "model": "glm-5.1"}]}
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._configured_fallback_entries", return_value=cfg["fallback_providers"]), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._rate_limit_guard_skips", return_value=False), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fallback_client, "glm-5.1")), \
+             patch("agent.auxiliary_client._try_payment_fallback", return_value=None), \
+             patch("agent.auxiliary_client._evict_cached_client_instance") as evict:
+            with pytest.raises(Exception, match="primary 429"):
+                call_llm(
+                    task="session_search",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        assert not evict.called
+
+    def test_explicit_provider_does_not_use_configured_fallback_chain(self):
+        """Explicit auxiliary providers are hard constraints and should not roam."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_429_rate_limit_error()
+
+        cfg = {"fallback_providers": [{"provider": "opencode-go", "model": "deepseek-v4-pro"}]}
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "glm-5.1")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("zai", "glm-5.1", None, None, None)), \
+             patch("agent.auxiliary_client._configured_fallback_entries", return_value=cfg["fallback_providers"]), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._rate_limit_guard_skips", return_value=False), \
+             patch("agent.auxiliary_client.resolve_provider_client") as resolve_fallback, \
+             patch("agent.auxiliary_client._try_payment_fallback", return_value=None):
+            with pytest.raises(Exception, match="Rate limit"):
+                call_llm(
+                    task="session_search",
+                    provider="zai",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        assert not resolve_fallback.called
+
+
+class TestAsyncCallLlmConfiguredFallback:
+    """async_call_llm() should mirror configured fallback behavior for session summaries."""
+
+    def _make_429_rate_limit_error(self, msg="Rate limit exceeded, try again in 60 seconds"):
+        exc = Exception(msg)
+        exc.status_code = 429
+        return exc
+
+    @pytest.mark.asyncio
+    async def test_async_auto_uses_configured_fallback_provider_directly(self):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://chatgpt.com/backend-api/codex"
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=self._make_429_rate_limit_error()
+        )
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.z.ai/api/coding/paas/v4"
+        fallback_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="async configured fallback"))
+        ]))
+
+        cfg = {
+            "fallback_providers": [
+                {"provider": "zai", "model": "glm-5.1", "key_env": "GLM_API_KEY"},
+            ]
+        }
+        resolve_calls = []
+
+        def fake_resolve(provider, **kwargs):
+            resolve_calls.append((provider, kwargs))
+            assert kwargs["async_mode"] is True
+            assert kwargs["explicit_api_key"] == "glm-key"
+            return fallback_client, "glm-5.1"
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._configured_fallback_entries", return_value=cfg["fallback_providers"]), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._rate_limit_guard_skips", return_value=False), \
+             patch.dict(os.environ, {"GLM_API_KEY": "glm-key"}), \
+             patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+             patch("agent.auxiliary_client._try_payment_fallback", return_value=None) as legacy, \
+             patch("agent.auxiliary_client._to_async_client") as to_async:
+            result = await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "async configured fallback"
+        assert [provider for provider, _ in resolve_calls] == ["zai"]
+        assert not legacy.called
+        assert not to_async.called
+
+    @pytest.mark.asyncio
+    async def test_async_primary_connection_error_still_evicts_after_configured_fallback_rate_limit(self):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=Exception("connection refused: timeout")
+        )
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create = AsyncMock(
+            side_effect=self._make_429_rate_limit_error("fallback 429")
+        )
+        cfg = {"fallback_providers": [{"provider": "zai", "model": "glm-5.1"}]}
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._configured_fallback_entries", return_value=cfg["fallback_providers"]), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._rate_limit_guard_skips", return_value=False), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fallback_client, "glm-5.1")), \
+             patch("agent.auxiliary_client._try_payment_fallback", return_value=None), \
+             patch("agent.auxiliary_client._evict_cached_client_instance") as evict:
+            with pytest.raises(Exception, match="connection refused"):
+                await async_call_llm(
+                    task="session_search",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        evict.assert_called_once_with(primary_client)
+
+    @pytest.mark.asyncio
+    async def test_async_primary_rate_limit_not_evicted_when_configured_fallback_connection_fails(self):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=self._make_429_rate_limit_error("primary 429")
+        )
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create = AsyncMock(
+            side_effect=Exception("connection refused: fallback timeout")
+        )
+        cfg = {"fallback_providers": [{"provider": "zai", "model": "glm-5.1"}]}
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._configured_fallback_entries", return_value=cfg["fallback_providers"]), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client._rate_limit_guard_skips", return_value=False), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fallback_client, "glm-5.1")), \
+             patch("agent.auxiliary_client._try_payment_fallback", return_value=None), \
+             patch("agent.auxiliary_client._evict_cached_client_instance") as evict:
+            with pytest.raises(Exception, match="primary 429"):
+                await async_call_llm(
+                    task="session_search",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        assert not evict.called
 
 
 # ---------------------------------------------------------------------------
@@ -3133,6 +3457,7 @@ class TestAuxUnhealthyCache:
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4.6"), \
              patch("agent.auxiliary_client.resolve_provider_client") as step1, \
+             patch("agent.auxiliary_client._try_guard_recommended", return_value=(None, None)), \
              patch("agent.auxiliary_client._try_openrouter") as or_try, \
              patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "n-model")), \
              patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \

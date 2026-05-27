@@ -1489,6 +1489,31 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 
+def _try_guard_recommended(
+    explicit_api_key: str = None, model: str = None
+) -> Tuple[Optional[OpenAI], Optional[str]]:
+    """Try the rate-limit guard's recommended provider for auxiliary tasks.
+
+    This mirrors the same routing the main conversation loop uses
+    (zai → opencode-go → deepseek PAYG), respecting watchdog state
+    so compression/summarisation don't retry exhausted providers.
+    """
+    try:
+        from agent.rate_limit_guard import get_auxiliary_recommendation
+    except ImportError:
+        return None, None
+
+    prov, rec_model = get_auxiliary_recommendation()
+    if not prov or not rec_model:
+        return None, None
+
+    # Resolve through the standard provider client path
+    result = resolve_provider_client(prov, model=rec_model)
+    if isinstance(result, tuple) and len(result) == 2:
+        return result
+    return None, None
+
+
 def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
@@ -2110,6 +2135,7 @@ def _get_provider_chain() -> List[tuple]:
     a caller explicitly requests it with a model.
     """
     return [
+        ("guard", _try_guard_recommended),  # Respect rate-limit guard first
         ("openrouter", _try_openrouter),
         ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
@@ -4557,6 +4583,163 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
     return {}
 
 
+def _configured_fallback_entries() -> List[Dict[str, Any]]:
+    """Return sanitized top-level fallback_providers entries from config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+    except Exception:
+        return []
+    raw_entries = config.get("fallback_providers", []) if isinstance(config, dict) else []
+    if not isinstance(raw_entries, list):
+        return []
+    entries: List[Dict[str, Any]] = []
+    for raw in raw_entries:
+        if not isinstance(raw, dict):
+            continue
+        provider = str(raw.get("provider", "")).strip()
+        model = str(raw.get("model", "")).strip()
+        if not provider or not model:
+            continue
+        entry = dict(raw)
+        entry["provider"] = provider
+        entry["model"] = model
+        entries.append(entry)
+    return entries
+
+
+def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
+    """Resolve an explicit api_key/key_env override for a fallback entry."""
+    raw_key = str(entry.get("api_key", "") or "").strip()
+    if raw_key:
+        return raw_key
+    key_env = str(
+        entry.get("key_env", "") or entry.get("api_key_env", "") or ""
+    ).strip()
+    if key_env:
+        return os.getenv(key_env, "").strip() or None
+    return None
+
+
+def _fallback_identity(provider: Optional[str], model: Optional[str], base_url: Optional[str]) -> tuple:
+    return (
+        _normalize_aux_provider(provider or ""),
+        (model or "").strip(),
+        (base_url or "").strip().rstrip("/"),
+    )
+
+
+def _fallback_error_is_retryable(exc: Exception) -> bool:
+    return _is_payment_error(exc) or _is_connection_error(exc) or _is_rate_limit_error(exc)
+
+
+def _rate_limit_guard_skips(provider: str, model: str) -> bool:
+    try:
+        from agent.rate_limit_guard import should_skip_provider
+        return bool(should_skip_provider(provider, model))
+    except Exception:
+        return False
+
+
+def _iter_configured_fallback_clients(
+    *,
+    task: Optional[str],
+    failed_provider: Optional[str],
+    failed_model: Optional[str],
+    failed_base_url: Optional[str],
+    async_mode: bool,
+    attempted: set,
+):
+    """Yield configured main fallback provider clients for auto auxiliary retry.
+
+    This intentionally does not mutate main-chat fallback state. It reuses the
+    standard auxiliary provider resolver so base_url/api_mode/key_env handling
+    stays centralized.
+    """
+    failed_identity = _fallback_identity(failed_provider, failed_model, failed_base_url)
+    for entry in _configured_fallback_entries():
+        provider = _normalize_aux_provider(entry.get("provider"))
+        model = str(entry.get("model", "") or "").strip()
+        base_url = str(entry.get("base_url", "") or "").strip() or None
+        api_mode = str(entry.get("api_mode", "") or "").strip() or None
+        identity = _fallback_identity(provider, model, base_url)
+        same_endpoint_as_failed = bool(
+            base_url
+            and failed_base_url
+            and base_url.rstrip("/") == str(failed_base_url).strip().rstrip("/")
+            and model == (failed_model or "").strip()
+        )
+        if identity in attempted or identity == failed_identity or same_endpoint_as_failed:
+            logger.info(
+                "Auxiliary %s: skipping configured fallback %s/%s (duplicate/current)",
+                task or "call", provider, model,
+            )
+            continue
+        attempted.add(identity)
+        if _is_provider_unhealthy(provider):
+            _log_skip_unhealthy(provider, task)
+            continue
+        if _rate_limit_guard_skips(provider, model):
+            logger.info(
+                "Auxiliary %s: skipping configured fallback %s/%s (rate-limit guard)",
+                task or "call", provider, model,
+            )
+            continue
+        api_key = _fallback_entry_api_key(entry)
+        try:
+            client, resolved_model = resolve_provider_client(
+                provider,
+                model=model,
+                async_mode=async_mode,
+                explicit_base_url=base_url,
+                explicit_api_key=api_key,
+                api_mode=api_mode,
+            )
+        except Exception as exc:
+            logger.info(
+                "Auxiliary %s: configured fallback %s/%s resolver failed: %s",
+                task or "call", provider, model, exc,
+            )
+            continue
+        if client is None:
+            logger.info(
+                "Auxiliary %s: configured fallback %s/%s unavailable",
+                task or "call", provider, model,
+            )
+            continue
+        yield provider, client, resolved_model or model, base_url
+
+
+def _build_fallback_kwargs(
+    provider: str,
+    model: str,
+    client: Any,
+    messages: list,
+    *,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    timeout: float,
+    extra_body: Dict[str, Any],
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    client_base = str(getattr(client, "base_url", "") or "")
+    kwargs = _build_call_kwargs(
+        provider,
+        model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        timeout=timeout,
+        extra_body=extra_body,
+        base_url=client_base or base_url,
+    )
+    if _is_anthropic_compat_endpoint(provider, client_base):
+        kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+    return kwargs
+
+
 # ---------------------------------------------------------------------------
 # Anthropic-compatible endpoint detection + image block conversion
 # ---------------------------------------------------------------------------
@@ -5082,26 +5265,55 @@ def call_llm(
                 reason = "rate limit"
             else:
                 reason = "connection error"
-            logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
+            logger.info("Auxiliary %s: %s on %s (%s), trying configured fallback chain",
                         task or "call", reason, resolved_provider, first_err)
+            attempted = {
+                _fallback_identity(
+                    resolved_provider,
+                    final_model or resolved_model,
+                    _base_info or resolved_base_url,
+                )
+            }
+            # Layer 1: Walk main fallback_providers chain
+            for fb_label, fb_client, fb_model, fb_base_url in _iter_configured_fallback_clients(
+                task=task,
+                failed_provider=resolved_provider,
+                failed_model=final_model or resolved_model,
+                failed_base_url=_base_info or resolved_base_url,
+                async_mode=False,
+                attempted=attempted,
+            ):
+                logger.info(
+                    "Auxiliary %s: trying configured fallback %s/%s after %s",
+                    task or "call", fb_label, fb_model, reason,
+                )
+                fb_kwargs = _build_fallback_kwargs(
+                    fb_label,
+                    fb_model,
+                    fb_client,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=fb_base_url,
+                )
+                try:
+                    return _validate_llm_response(
+                        fb_client.chat.completions.create(**fb_kwargs), task)
+                except Exception as fb_err:
+                    if not _fallback_error_is_retryable(fb_err):
+                        raise
+                    logger.info(
+                        "Auxiliary %s: configured fallback %s/%s failed with retryable error: %s",
+                        task or "call", fb_label, fb_model, fb_err,
+                    )
+                    continue
 
-            # Fallback order (#26882, #26803):
-            #   1. User-configured fallback_chain (per-task) if set
-            #   2. Main agent model (last-resort safety net)
-            # For auto users (no explicit aux provider), use the full
-            # auto-detection chain instead — its Step 1 IS the main agent
-            # model, so users on `auto` already get main-model fallback.
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
-
+            # Layer 2: Per-task fallback_chain (explicit-provider users)
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, resolved_provider or "auto", reason=reason)
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
                     fb_label, fb_model, messages,
@@ -5111,12 +5323,44 @@ def call_llm(
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
                 return _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
-            # All fallback layers exhausted — emit a single user-visible
-            # warning so the operator knows aux task is about to fail.
-            # (#26882) The error itself is re-raised below.
+
+            # Layer 3: Main agent model safety net
+            fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                resolved_provider, task, reason=reason)
+            if fb_client is not None:
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model, messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                return _validate_llm_response(
+                    fb_client.chat.completions.create(**fb_kwargs), task)
+
+            # Layer 4: Legacy payment fallback
+            fb_result = _try_payment_fallback(resolved_provider, task, reason=reason)
+            if fb_result:
+                fb_client, fb_model, fb_label = fb_result
+                if fb_client is not None:
+                    fb_kwargs = _build_fallback_kwargs(
+                        fb_label,
+                        fb_model,
+                        fb_client,
+                        messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        timeout=effective_timeout,
+                        extra_body=effective_extra_body,
+                    )
+                    return _validate_llm_response(
+                        fb_client.chat.completions.create(**fb_kwargs), task)
+
+            # All fallback layers exhausted
             logger.warning(
                 "Auxiliary %s: %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(fallback_providers + fallback_chain + main agent model + payment fallback). "
+                "Raising original error.",
                 task or "call", reason, resolved_provider,
             )
         # Connection/timeout errors leave the cached client poisoned (closed
@@ -5130,7 +5374,7 @@ def call_llm(
             except Exception:
                 logger.debug("Auxiliary: cache eviction after connection error failed",
                              exc_info=True)
-        raise
+        raise first_err
 
 
 def extract_content_or_reasoning(response) -> str:
@@ -5447,25 +5691,55 @@ async def async_call_llm(
                 reason = "rate limit"
             else:
                 reason = "connection error"
-            logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
+            logger.info("Auxiliary %s (async): %s on %s (%s), trying configured fallback chain",
                         task or "call", reason, resolved_provider, first_err)
+            attempted = {
+                _fallback_identity(
+                    resolved_provider,
+                    final_model or resolved_model,
+                    _client_base or resolved_base_url,
+                )
+            }
+            # Layer 1: Walk main fallback_providers chain
+            for fb_label, fb_client, fb_model, fb_base_url in _iter_configured_fallback_clients(
+                task=task,
+                failed_provider=resolved_provider,
+                failed_model=final_model or resolved_model,
+                failed_base_url=_client_base or resolved_base_url,
+                async_mode=True,
+                attempted=attempted,
+            ):
+                logger.info(
+                    "Auxiliary %s (async): trying configured fallback %s/%s after %s",
+                    task or "call", fb_label, fb_model, reason,
+                )
+                fb_kwargs = _build_fallback_kwargs(
+                    fb_label,
+                    fb_model,
+                    fb_client,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=fb_base_url,
+                )
+                try:
+                    return _validate_llm_response(
+                        await fb_client.chat.completions.create(**fb_kwargs), task)
+                except Exception as fb_err:
+                    if not _fallback_error_is_retryable(fb_err):
+                        raise
+                    logger.info(
+                        "Auxiliary %s (async): configured fallback %s/%s failed with retryable error: %s",
+                        task or "call", fb_label, fb_model, fb_err,
+                    )
+                    continue
 
-            # Fallback order (#26882, #26803):
-            #   1. User-configured fallback_chain (per-task) if set
-            #   2. Main agent model (last-resort safety net)
-            # Auto users get the full auto-detection chain instead — its
-            # Step 1 IS the main agent model.
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
-
+            # Layer 2: Per-task fallback_chain (explicit-provider users)
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, resolved_provider or "auto", reason=reason)
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
                     fb_label, fb_model, messages,
@@ -5473,7 +5747,6 @@ async def async_call_llm(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
-                # Convert sync fallback client to async
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
                 )
@@ -5481,10 +5754,54 @@ async def async_call_llm(
                     fb_kwargs["model"] = async_fb_model
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
-            # All fallback layers exhausted — warn before re-raising. (#26882)
+
+            # Layer 3: Main agent model safety net
+            fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                resolved_provider, task, reason=reason)
+            if fb_client is not None:
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model, messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                async_fb, async_fb_model = _to_async_client(
+                    fb_client, fb_model or "", is_vision=(task == "vision")
+                )
+                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                    fb_kwargs["model"] = async_fb_model
+                return _validate_llm_response(
+                    await async_fb.chat.completions.create(**fb_kwargs), task)
+
+            # Layer 4: Legacy payment fallback
+            fb_result = _try_payment_fallback(resolved_provider, task, reason=reason)
+            if fb_result:
+                fb_client, fb_model, fb_label = fb_result
+                if fb_client is not None:
+                    fb_kwargs = _build_fallback_kwargs(
+                        fb_label,
+                        fb_model,
+                        fb_client,
+                        messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        timeout=effective_timeout,
+                        extra_body=effective_extra_body,
+                    )
+                    async_fb, async_fb_model = _to_async_client(
+                        fb_client, fb_model or "", is_vision=(task == "vision")
+                    )
+                    if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                        fb_kwargs["model"] = async_fb_model
+                    return _validate_llm_response(
+                        await async_fb.chat.completions.create(**fb_kwargs), task)
+
+            # All fallback layers exhausted
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(fallback_providers + fallback_chain + main agent model + payment fallback). "
+                "Raising original error.",
                 task or "call", reason, resolved_provider,
             )
         # Mirror the sync path: drop poisoned clients on connection/timeout
@@ -5495,4 +5812,4 @@ async def async_call_llm(
             except Exception:
                 logger.debug("Auxiliary (async): cache eviction after connection error failed",
                              exc_info=True)
-        raise
+        raise first_err
